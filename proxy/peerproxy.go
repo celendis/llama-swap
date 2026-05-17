@@ -1,17 +1,29 @@
 package proxy
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/proxy/config"
+)
+
+var ErrPeerWakeTimeout = errors.New("peer wake timed out")
+
+const (
+	peerWakeTimeout   = 30 * time.Second
+	peerProbeInterval = 1 * time.Second
+	peerProbeTimeout  = 2 * time.Second
 )
 
 type peerProxyMember struct {
@@ -20,9 +32,22 @@ type peerProxyMember struct {
 	apiKey       string
 }
 
+type wakeState struct {
+	done chan struct{}
+	err  error
+}
+
 type PeerProxy struct {
 	peers    config.PeerDictionaryConfig
 	proxyMap map[string]*peerProxyMember
+
+	wakeMu    sync.Mutex
+	wakeState map[string]*wakeState
+
+	wakeTimeout time.Duration
+
+	probeReachability func(context.Context, *url.URL) error
+	sendWakePacket    func(config.WakeOnLanConfig) error
 }
 
 func NewPeerProxy(peers config.PeerDictionaryConfig, proxyLogger *logmon.Monitor) (*PeerProxy, error) {
@@ -34,6 +59,15 @@ func NewPeerProxy(peers config.PeerDictionaryConfig, proxyLogger *logmon.Monitor
 		peerIDs = append(peerIDs, peerID)
 	}
 	sort.Strings(peerIDs)
+
+	pp := &PeerProxy{
+		peers:             peers,
+		proxyMap:          proxyMap,
+		wakeState:         make(map[string]*wakeState),
+		wakeTimeout:       peerWakeTimeout,
+		probeReachability: probeTCPReachability,
+		sendWakePacket:    sendMagicPacket,
+	}
 
 	for _, peerID := range peerIDs {
 		peer := peers[peerID]
@@ -54,16 +88,16 @@ func NewPeerProxy(peers config.PeerDictionaryConfig, proxyLogger *logmon.Monitor
 			IdleConnTimeout:       time.Duration(peer.Timeouts.IdleConn) * time.Second,
 		}
 
-		// Create reverse proxy for this peer
-		reverseProxy := httputil.NewSingleHostReverseProxy(peer.ProxyURL)
-		reverseProxy.Transport = peerTransport
+		// Create reverse proxy for this peer.
+		reverseProxy := &httputil.ReverseProxy{
+			Transport: peerTransport,
+		}
 
-		// Wrap Director to set Host header for remote hosts (not localhost)
-		originalDirector := reverseProxy.Director
-		reverseProxy.Director = func(req *http.Request) {
-			originalDirector(req)
-			// Ensure Host header matches target URL for remote proxying
-			req.Host = req.URL.Host
+		// Rewrite the outbound request to the peer and keep the Host header aligned
+		// with the target URL for remote proxying.
+		reverseProxy.Rewrite = func(pr *httputil.ProxyRequest) {
+			pr.SetURL(peer.ProxyURL)
+			pr.Out.Host = pr.Out.URL.Host
 		}
 
 		reverseProxy.ModifyResponse = func(resp *http.Response) error {
@@ -82,7 +116,7 @@ func NewPeerProxy(peers config.PeerDictionaryConfig, proxyLogger *logmon.Monitor
 			http.Error(w, errMsg, http.StatusBadGateway)
 		}
 
-		pp := &peerProxyMember{
+		ppMember := &peerProxyMember{
 			peerID:       peerID,
 			reverseProxy: reverseProxy,
 			apiKey:       peer.ApiKey,
@@ -94,14 +128,11 @@ func NewPeerProxy(peers config.PeerDictionaryConfig, proxyLogger *logmon.Monitor
 				proxyLogger.Warnf("peer %s: model %s already mapped to another peer, skipping", peerID, modelID)
 				continue
 			}
-			proxyMap[modelID] = pp
+			proxyMap[modelID] = ppMember
 		}
 	}
 
-	return &PeerProxy{
-		peers:    peers,
-		proxyMap: proxyMap,
-	}, nil
+	return pp, nil
 }
 
 func (p *PeerProxy) HasPeerModel(modelID string) bool {
@@ -127,10 +158,23 @@ func (p *PeerProxy) ListPeers() config.PeerDictionaryConfig {
 	return p.peers
 }
 
-func (p *PeerProxy) ProxyRequest(model_id string, writer http.ResponseWriter, request *http.Request) error {
-	pp, found := p.proxyMap[model_id]
+func (p *PeerProxy) ProxyRequest(modelID string, writer http.ResponseWriter, request *http.Request) error {
+	pp, found := p.proxyMap[modelID]
 	if !found {
-		return fmt.Errorf("no peer proxy found for model %s", model_id)
+		return fmt.Errorf("no peer proxy found for model %s", modelID)
+	}
+
+	peer, found := p.peers[pp.peerID]
+	if !found {
+		return fmt.Errorf("peer configuration not found for model %s", modelID)
+	}
+
+	if err := p.ensurePeerAwake(request.Context(), pp.peerID, peer); err != nil {
+		if errors.Is(err, ErrPeerWakeTimeout) {
+			http.Error(writer, err.Error(), http.StatusGatewayTimeout)
+			return nil
+		}
+		return err
 	}
 
 	// Inject API key if configured for this peer
@@ -141,4 +185,86 @@ func (p *PeerProxy) ProxyRequest(model_id string, writer http.ResponseWriter, re
 
 	pp.reverseProxy.ServeHTTP(writer, request)
 	return nil
+}
+
+func (p *PeerProxy) ensurePeerAwake(ctx context.Context, peerID string, peer config.PeerConfig) error {
+	if peer.WakeOnLan == nil {
+		return nil
+	}
+
+	if err := p.probeReachabilityWithTimeout(ctx, peer.ProxyURL); err == nil {
+		return nil
+	}
+
+	state := p.getOrStartWake(peerID, peer)
+	select {
+	case <-state.done:
+		return state.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *PeerProxy) getOrStartWake(peerID string, peer config.PeerConfig) *wakeState {
+	p.wakeMu.Lock()
+	defer p.wakeMu.Unlock()
+
+	if existing, ok := p.wakeState[peerID]; ok {
+		return existing
+	}
+
+	state := &wakeState{done: make(chan struct{})}
+	p.wakeState[peerID] = state
+
+	go func() {
+		defer close(state.done)
+		defer p.clearWakeState(peerID)
+		state.err = p.performWake(peer)
+	}()
+
+	return state
+}
+
+func (p *PeerProxy) clearWakeState(peerID string) {
+	p.wakeMu.Lock()
+	delete(p.wakeState, peerID)
+	p.wakeMu.Unlock()
+}
+
+func (p *PeerProxy) performWake(peer config.PeerConfig) error {
+	wakeTimeout := p.wakeTimeout
+	if wakeTimeout <= 0 {
+		wakeTimeout = peerWakeTimeout
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), wakeTimeout)
+	defer cancel()
+
+	if err := p.sendWakePacket(*peer.WakeOnLan); err != nil {
+		return err
+	}
+
+	ticker := time.NewTicker(peerProbeInterval)
+	defer ticker.Stop()
+
+	if err := p.probeReachabilityWithTimeout(ctx, peer.ProxyURL); err == nil {
+		return nil
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ErrPeerWakeTimeout
+		case <-ticker.C:
+			if err := p.probeReachabilityWithTimeout(ctx, peer.ProxyURL); err == nil {
+				return nil
+			}
+		}
+	}
+}
+
+func (p *PeerProxy) probeReachabilityWithTimeout(ctx context.Context, target *url.URL) error {
+	probeCtx, cancel := context.WithTimeout(ctx, peerProbeTimeout)
+	defer cancel()
+	return p.probeReachability(probeCtx, target)
 }

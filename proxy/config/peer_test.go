@@ -33,6 +33,18 @@ models:
 			wantErr: "",
 		},
 		{
+			name: "valid config with wake on lan",
+			yaml: `
+proxy: http://192.168.1.23:11434
+models:
+  - model_a
+wakeOnLan:
+  mac: aa-bb-cc-dd-ee-ff
+  broadcast: 192.168.1.255
+`,
+			wantErr: "",
+		},
+		{
 			name: "missing proxy",
 			yaml: `
 models:
@@ -72,6 +84,29 @@ proxy: http://localhost:8080
 models: []
 `,
 			wantErr: "peer models can not be empty",
+		},
+		{
+			name: "invalid wake on lan mac",
+			yaml: `
+proxy: http://localhost:8080
+models:
+  - model_a
+wakeOnLan:
+  mac: not-a-mac
+`,
+			wantErr: "invalid wakeOnLan mac",
+		},
+		{
+			name: "invalid wake on lan broadcast",
+			yaml: `
+proxy: http://localhost:8080
+models:
+  - model_a
+wakeOnLan:
+  mac: aa:bb:cc:dd:ee:ff
+  broadcast: not-an-ip
+`,
+			wantErr: "invalid wakeOnLan broadcast address",
 		},
 	}
 
@@ -170,6 +205,34 @@ filters:
 	}
 	if provider["data_collection"] != "deny" {
 		t.Errorf("expected data_collection deny, got %v", provider["data_collection"])
+	}
+}
+
+func TestPeerConfig_WithWakeOnLan(t *testing.T) {
+	yamlData := `
+proxy: http://192.168.1.23:11434
+models:
+  - model_a
+wakeOnLan:
+  mac: aa-bb-cc-dd-ee-ff
+  broadcast: 192.168.1.255
+`
+	var config PeerConfig
+	err := yaml.Unmarshal([]byte(yamlData), &config)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if config.WakeOnLan == nil {
+		t.Fatal("WakeOnLan should not be nil")
+	}
+
+	if config.WakeOnLan.MAC != "aa:bb:cc:dd:ee:ff" {
+		t.Errorf("expected normalized MAC %q, got %q", "aa:bb:cc:dd:ee:ff", config.WakeOnLan.MAC)
+	}
+
+	if config.WakeOnLan.Broadcast != "192.168.1.255" {
+		t.Errorf("expected broadcast %q, got %q", "192.168.1.255", config.WakeOnLan.Broadcast)
 	}
 }
 

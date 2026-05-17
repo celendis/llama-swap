@@ -2,19 +2,53 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 )
 
 type PeerDictionaryConfig map[string]PeerConfig
+
+type WakeOnLanConfig struct {
+	MAC       string `yaml:"mac"`
+	Broadcast string `yaml:"broadcast"`
+}
+
 type PeerConfig struct {
-	Proxy    string   `yaml:"proxy"`
-	ProxyURL *url.URL `yaml:"-"`
-	ApiKey   string   `yaml:"apiKey"`
-	Models   []string `yaml:"models"`
-	Filters  Filters  `yaml:"filters"`
+	Proxy     string           `yaml:"proxy"`
+	ProxyURL  *url.URL         `yaml:"-"`
+	ApiKey    string           `yaml:"apiKey"`
+	Models    []string         `yaml:"models"`
+	Filters   Filters          `yaml:"filters"`
+	WakeOnLan *WakeOnLanConfig `yaml:"wakeOnLan"`
 
 	// Timeout settings for proxy connections
 	Timeouts TimeoutsConfig `yaml:"timeouts"`
+}
+
+func (c *WakeOnLanConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	type rawWakeOnLanConfig WakeOnLanConfig
+	defaults := rawWakeOnLanConfig{}
+
+	if err := unmarshal(&defaults); err != nil {
+		return err
+	}
+
+	if defaults.MAC == "" {
+		return fmt.Errorf("wakeOnLan.mac is required")
+	}
+
+	hwAddr, err := net.ParseMAC(defaults.MAC)
+	if err != nil {
+		return fmt.Errorf("invalid wakeOnLan mac (%s): %w", defaults.MAC, err)
+	}
+	defaults.MAC = hwAddr.String()
+
+	if defaults.Broadcast != "" && net.ParseIP(defaults.Broadcast) == nil {
+		return fmt.Errorf("invalid wakeOnLan broadcast address (%s)", defaults.Broadcast)
+	}
+
+	*c = WakeOnLanConfig(defaults)
+	return nil
 }
 
 func (c *PeerConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {

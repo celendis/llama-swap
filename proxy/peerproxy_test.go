@@ -1,10 +1,15 @@
 package proxy
 
 import (
+	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -308,4 +313,190 @@ func TestNewPeerProxy_CustomTimeouts(t *testing.T) {
 	assert.Equal(t, 120*time.Second, transport.IdleConnTimeout)
 	// ForceAttemptHTTP2 should be enabled
 	assert.True(t, transport.ForceAttemptHTTP2)
+}
+
+func TestBuildMagicPacket(t *testing.T) {
+	packet, err := buildMagicPacket(net.HardwareAddr{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff})
+	require.NoError(t, err)
+	require.Len(t, packet, 102)
+
+	for i := 0; i < 6; i++ {
+		assert.Equal(t, byte(0xff), packet[i])
+	}
+	for offset := 6; offset < len(packet); offset += 6 {
+		assert.Equal(t, []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff}, packet[offset:offset+6])
+	}
+}
+
+func TestSendMagicPacket(t *testing.T) {
+	listener, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	require.NoError(t, err)
+	defer listener.Close()
+
+	packetCh := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, 256)
+		_ = listener.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, _, err := listener.ReadFromUDP(buf)
+		if err == nil {
+			packetCh <- append([]byte(nil), buf[:n]...)
+		}
+	}()
+
+	err = sendMagicPacketToPort(config.WakeOnLanConfig{
+		MAC:       "aa:bb:cc:dd:ee:ff",
+		Broadcast: "127.0.0.1",
+	}, listener.LocalAddr().(*net.UDPAddr).Port)
+	require.NoError(t, err)
+
+	select {
+	case packet := <-packetCh:
+		require.Len(t, packet, 102)
+		for i := 0; i < 6; i++ {
+			assert.Equal(t, byte(0xff), packet[i])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for wake packet")
+	}
+}
+
+func TestProxyRequest_WakeOnLan_WaitsForReachability(t *testing.T) {
+	peerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"response":"ready"}`))
+	}))
+	defer peerServer.Close()
+
+	proxyURL, _ := url.Parse(peerServer.URL)
+	peers := config.PeerDictionaryConfig{
+		"peer1": config.PeerConfig{
+			Proxy:    peerServer.URL,
+			ProxyURL: proxyURL,
+			Models:   []string{"sleeping-model"},
+			WakeOnLan: &config.WakeOnLanConfig{
+				MAC: "aa:bb:cc:dd:ee:ff",
+			},
+		},
+	}
+
+	pm, err := NewPeerProxy(peers, testLogger)
+	require.NoError(t, err)
+	pm.probeReachability = func(ctx context.Context, target *url.URL) error {
+		return errors.New("unreachable")
+	}
+
+	wakeTriggered := atomic.Bool{}
+	pm.sendWakePacket = func(wol config.WakeOnLanConfig) error {
+		wakeTriggered.Store(true)
+		pm.probeReachability = func(ctx context.Context, target *url.URL) error {
+			if wakeTriggered.Load() {
+				return nil
+			}
+			return errors.New("unreachable")
+		}
+		return nil
+	}
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	w := httptest.NewRecorder()
+
+	err = pm.ProxyRequest("sleeping-model", w, req)
+	require.NoError(t, err)
+	assert.True(t, wakeTriggered.Load())
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), "ready")
+}
+
+func TestProxyRequest_WakeOnLan_SharedWakeAttempt(t *testing.T) {
+	peerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"response":"ready"}`))
+	}))
+	defer peerServer.Close()
+
+	proxyURL, _ := url.Parse(peerServer.URL)
+	peers := config.PeerDictionaryConfig{
+		"peer1": config.PeerConfig{
+			Proxy:    peerServer.URL,
+			ProxyURL: proxyURL,
+			Models:   []string{"sleeping-model"},
+			WakeOnLan: &config.WakeOnLanConfig{
+				MAC: "aa:bb:cc:dd:ee:ff",
+			},
+		},
+	}
+
+	pm, err := NewPeerProxy(peers, testLogger)
+	require.NoError(t, err)
+
+	var wakeCount atomic.Int32
+	ready := make(chan struct{})
+	readyOnce := sync.Once{}
+
+	pm.probeReachability = func(ctx context.Context, target *url.URL) error {
+		select {
+		case <-ready:
+			return nil
+		default:
+			return errors.New("unreachable")
+		}
+	}
+
+	pm.sendWakePacket = func(wol config.WakeOnLanConfig) error {
+		if wakeCount.Add(1) == 1 {
+			readyOnce.Do(func() { close(ready) })
+		}
+		return nil
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+			w := httptest.NewRecorder()
+			errs <- pm.ProxyRequest("sleeping-model", w, req)
+			require.Equal(t, http.StatusOK, w.Code)
+		}()
+	}
+
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	assert.Equal(t, int32(1), wakeCount.Load())
+}
+
+func TestProxyRequest_WakeOnLan_Timeout(t *testing.T) {
+	proxyURL, _ := url.Parse("http://127.0.0.1:65534")
+	peers := config.PeerDictionaryConfig{
+		"peer1": config.PeerConfig{
+			Proxy:    "http://127.0.0.1:65534",
+			ProxyURL: proxyURL,
+			Models:   []string{"sleeping-model"},
+			WakeOnLan: &config.WakeOnLanConfig{
+				MAC: "aa:bb:cc:dd:ee:ff",
+			},
+		},
+	}
+
+	pm, err := NewPeerProxy(peers, testLogger)
+	require.NoError(t, err)
+	pm.wakeTimeout = 25 * time.Millisecond
+	pm.probeReachability = func(ctx context.Context, target *url.URL) error {
+		return errors.New("unreachable")
+	}
+	pm.sendWakePacket = func(wol config.WakeOnLanConfig) error { return nil }
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	w := httptest.NewRecorder()
+
+	err = pm.ProxyRequest("sleeping-model", w, req)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusGatewayTimeout, w.Code)
+	assert.Contains(t, w.Body.String(), "peer wake timed out")
 }

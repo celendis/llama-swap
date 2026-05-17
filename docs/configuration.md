@@ -539,6 +539,11 @@ peers:
     # - required
     # - requested path to llama-swap will be appended to the end of the proxy value
     proxy: http://192.168.1.23
+    # wakeOnLan: optional settings to wake a sleeping peer before proxying
+    # - mac is required when this block is present
+    # - broadcast defaults to 255.255.255.255 when omitted
+    wakeOnLan:
+      mac: aa:bb:cc:dd:ee:ff
     # models: a list of models served by the peer
     # - required
     models:
