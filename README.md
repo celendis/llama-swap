@@ -59,6 +59,7 @@ Built in Go for performance and simplicity, llama-swap has zero dependencies and
   - Automatic unloading of models after timeout by setting a `ttl`
   - Docker and Podman support using `cmd` and `cmdStop` together
   - Preload models on startup with `hooks` ([#235](https://github.com/mostlygeek/llama-swap/pull/235))
+  - Wake sleeping peer models with Wake-on-LAN before proxying requests
   - Apply filters to requests to control inference with `stripParams`, `setParams` and `setParamsByID`
 
 ### Web UI
@@ -210,6 +211,24 @@ Almost all configuration settings are optional and can be added one step at a ti
   - `useModelName` to override model names sent to upstream servers
   - `${PORT}` automatic port variables for dynamic port assignment
   - `filters` rewrite parts of requests before sending to the upstream server
+
+### Peer models and Wake-on-LAN
+
+Peer models can point llama-swap at another inference server, including a sleeping machine that is woken on demand. When a peer request arrives, llama-swap sends a Wake-on-LAN magic packet to the configured MAC address, waits for the peer to become reachable, and then proxies the request.
+
+```yaml
+peers:
+  llama-swap-peer:
+    proxy: http://peer-host.example:8001
+    wakeOnLan:
+      mac: aa:bb:cc:dd:ee:ff
+      broadcast: 192.168.1.255
+    models:
+      - qwen3.5-9b
+      - qwen3.6-35b
+```
+
+If `broadcast` is omitted, llama-swap uses the default broadcast address. WOL is peer-scoped, so every model served by the same peer shares the same wake target.
 
 See the [configuration documentation](docs/configuration.md) for all options.
 
